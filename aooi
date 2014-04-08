@@ -1,0 +1,507 @@
+#!/bin/sh
+
+#
+# Atomic Offline OS installer (AOOI)
+# install CentOS to a running system
+# Due to the network in 1and1, we cant do a normal ks install, we need to drop off the CD to the local disk
+#
+# probably want to store on sdb2, so sda can be wiped. Followup in %post to finish creating the RAID
+# initial tests caused problems with booting on a raid. Probably too large.
+
+# network or local
+
+
+VERSION="2.0.2"
+DISTVERSION="6.5"   # CentOS version
+
+# Apparently debian doesnt support -i?
+#ARCH=`uname -i`   # What ARCH are we on
+
+M_ARCH=`arch`
+
+if [ "$M_ARCH" == "x86_64" ]; then
+  ARCH=x86_64
+else
+  ARCH=i386
+fi
+
+function check_input {
+  message=$1
+  validate=$2
+  default=$3
+
+  while [ $? -ne 1 ]; do
+    echo -n "$message "
+    read INPUTTEXT < /dev/tty
+    if [ "$INPUTTEXT" == "" -a "$default" != "" ]; then
+      INPUTTEXT=$default
+      return 1
+    fi
+    echo $INPUTTEXT | egrep -q "$validate" && return 1
+    echo "Invalid input"
+  done
+}
+
+
+echo
+echo "Atomic Offline OS Installer (AOOI)"
+echo "by Scott R. Shinn <scott@atomicrocketturtle.com>"
+echo "Version $VERSION"
+echo 
+echo "Credits: "
+echo "www.gnuker.com"
+echo "www.nefw.net"
+echo "www.orionhost.net"
+echo "www.protechone.com"
+echo "Robinet at 1and1.fr"
+echo "Igor at CloudLinux"
+echo 
+echo "AOOI is designed to re-image a server with either CentOS or Cloudlinux."
+echo "This installer does not back up your data, if for "
+echo "any reason it fails you will need to reimage the system."
+echo
+echo "Hit enter if you accept this risk and wish to continue,"
+echo "otherwise hit Ctrl-C to quit"
+read < /dev/tty
+echo
+echo
+echo "Turtle power."
+sleep 2
+echo
+echo
+
+echo
+check_input "Would you like to re-image the system with CentOS  $DISTVERSION or Cloudlinux $DISTVERSION (centos/cloudlinux) [Default: centos]" "centos|cloudlinux" "centos"
+
+INSTALL_DIST=$INPUTTEXT
+
+echo 
+echo "Selected $INSTALL_DIST"
+echo
+
+if [ "$INSTALL_DIST" == "cloudlinux" ]; then
+	MIRRORSITE="http://repo.cloudlinux.com/cloudlinux/"
+    	ISOS="CloudLinux-$DISTVERSION-$ARCH-CD1.iso CloudLinux-$DISTVERSION-$ARCH-CD2.iso"
+    	FIRSTISO="CloudLinux-$DISTVERSION-$ARCH-CD1.iso"
+else
+	MIRRORSITE="http://mirrors.kernel.org/centos/"
+    	ISOS="CentOS-$DISTVERSION-$ARCH-minimal.iso"
+    	FIRSTISO="CentOS-$DISTVERSION-$ARCH-minimal.iso"
+	
+fi
+
+
+## OS checks
+
+# Detect if we're on debian
+if egrep -q "Debian|Ubuntu" /etc/issue; then
+  DEBIAN=1
+  # Debian doesnt come with strings?
+  if [ ! -f /usr/bin/strings ]; then
+    apt-get -y --force-yes install binutils  
+  fi
+
+  if [ $? -gt 0 ]; then
+    echo "  There appears to have been a problem with apt. Attempting to resolve..."
+    sleep 2
+    apt-get update 
+    apt-get -y --force-yes install binutils  
+  fi
+else
+  # Guess what? 1and1 can break centos too.
+  if [ ! -f /usr/bin/strings ]; then
+    yum -y install binutils
+  fi
+fi
+
+
+
+# More debian fixes, uname -i returns unknown.
+if [ "$ARCH" == "unknown" ]; then
+  ARCH=x86_64
+fi
+
+# Detect if we're on SuSE
+if [ -f /etc/SuSE-release ]; then
+  SUSE=1
+fi
+
+
+LOCALSERVER=$1	  # Pull the ISO from localhost
+
+
+## Get network variables
+#if [ "$DEBIAN" == "1" ] ; then
+  IPADDR=`ifconfig eth0 | sed 's/:/ /' | awk '/inet addr/ {print $3}'`
+  NETMASK=`ifconfig eth0 | sed 's/:/ /g' | awk '/inet addr/ {print $7}'`
+  GATEWAY=`route -n |grep UG | awk '{print $2}'`
+  DNS=`grep nameserver /etc/resolv.conf |head -n 1 | awk '{print $2}'`
+
+#else
+#  # load network settings into our config, and figure out our DNS server
+#  if [ -f /etc/sysconfig/network-scripts/ifcfg-eth0 ]; then
+#    . /etc/sysconfig/network-scripts/ifcfg-eth0
+#  fi
+#fi
+
+
+## Figure out what bootloader we're using. 
+DEVICES="hda hdb hdc hdd hde sda sdb sdc sdd sde"
+
+echo > /tmp/disk.out
+for i in $DEVICES; do
+  dd if=/dev/$i bs=512 count=1 2>/dev/null |strings >> /tmp/disk.out
+done
+
+NOGRUBBY=0
+if grep -q GRUB /tmp/disk.out ; then
+  LOADER=GRUB
+  # Check for grubby
+  if [ ! -x /sbin/grubby ]; then
+    echo "Error: /sbin/grubby not detected, This is probably debian. Trying an alternate method"
+    NOGRUBBY=1
+  fi
+
+  GRUB=`which grub`
+fi
+
+if grep -q LILO /tmp/disk.out ; then
+  if [ -f /sbin/lilo ]; then
+    LOADER=LILO
+  else
+    echo "Error: LILO was detected as the boot loader, but /sbin/lilo was not detected. This is most likely a customized distribution. Exiting..."
+    exit 1
+  fi
+fi
+
+if [ "$LOADER" == "" ]; then
+  echo "Error: Couldn't determine boot loader"
+  exit 1
+fi
+
+
+# Network Install function
+function netinstall {
+  INSTALL=NETWORK
+  if [ -d /boot ]; then
+    cd /boot
+    # grab the iso boot images
+    wget --no-cache -O - $MIRRORSITE/$DISTVERSION/os/$ARCH/isolinux/vmlinuz > /boot/vmlinuz.atomic || exit 1
+    wget --no-cache -O - $MIRRORSITE/$DISTVERSION/os/$ARCH/isolinux/initrd.img > /boot/initrd.img.atomic || exit 1
+
+    # add them to the bootloader
+    addkernel  
+
+  else
+    echo "Error: Could not determine where to store boot image, exiting"
+    exit 1
+  fi
+}
+
+function localinstall {
+  INSTALL=LOCAL
+#  if [ "$ARCH" == "x86_64" ]; then
+#  else
+#    ISOS="CentOS-$DISTVERSION-$ARCH-bin-1of7.iso"
+#    FIRSTISO=$ISOS
+#  fi
+
+  # Do we have sfdisk?
+  if [ ! -x /sbin/sfdisk ]; then
+    echo "sfdisk not detected. Exiting"
+    exit 1
+  fi
+  
+  # Are we at 1and1? 
+  if grep -q onlinehome /etc/yum.conf; then
+  #  echo "Detected broken 1and1 configuration "
+  #  mv /etc/yum.conf /etc/yum.conf.broken
+  #  cd /etc
+  #  wget -q http://3es.atomicrocketturtle.com/tests/config/yum.conf
+  #  yum clean all
+    BOOTLOADER=1AND1
+  fi
+
+  # Check for mkfs.vfat
+  if [ ! -x /sbin/mkfs.vfat ]; then
+    if [ "$DEBIAN" == "1" ]; then
+      apt-get install dosfstools
+    elif [ "$SUSE" == "1" ]; then
+      echo "mkfs.vfat not detected. This appears to be a SUSE system"
+      echo "Attempting to install dosfstools through yast, this can take a very long time"
+      echo
+      echo "Please be patient"
+      echo
+      echo "Hit any key to continue "
+      read foo < /dev/tty
+      yast -i dosfstools
+
+      if [ ! -d /mnt ]; then
+        mkdir /mnt
+      fi
+
+    else
+      echo "mkfs.vfat not detected. Attempting to resolve with: yum -y install dosfstools"
+      yum -y install dosfstools || exit 1
+    fi
+  fi
+
+  # disable swap, this gets tricky with multiple swap partitions
+  echo -n "Transferring image to swap: "
+  /sbin/swapoff -a
+
+
+  # Yes. This is ugly.
+  DEVS="sda sdb sdc sdd sde sdf hda hdb hdc hdd hde hdf"
+  PARTS="1 2 3 4 5 6 7 8"
+
+  count=0
+  # extract all the swap partitions
+  for data in `grep swap /etc/fstab |awk -Fdev/ '{print $2}' |awk '{print $1}'`; do
+    echo "$data" > /tmp/swap.out
+
+    # Test device name against the array to split this up for sfdisk
+    for i in $DEVS; do
+      for y in $PARTS; do
+
+        if grep -q $i$y /tmp/swap.out; then
+          # we do this on all swap partitions, just to make sure we dont zap them on a raid
+          SFSWAP="/dev/$i $y"
+          SWAP="/dev/$i$y"
+
+          # Make the fs vfat, and then set the disklabel
+          # except 1and1 doesnt do vfat any more. 
+          # this is annoying, the first time we'll set this to ext3. Vfat the 2nd pass.
+          if [ $count -lt 1 ]; then
+            /sbin/mkfs.ext3 $SWAP
+            count=`expr $count + 1`
+          else
+            /sbin/mkfs.vfat $SWAP  > /dev/null 2>/dev/null
+            if [ "$SUSE" == "1" ]; then
+              /sbin/mkfs.ext3 $SWAP
+            fi
+          fi
+
+          # Set the partition flag to vfat. Not that this helped protect the partition from anaconda. :P
+          /sbin/sfdisk --force --change-id $SFSWAP 7
+  
+          # If KSDEV isnt defined, assign it, otherwise skip it
+          if [ ! $KSDEV  ]; then
+            KSDEV="$i$y"
+  
+            # We only need to mount the first swap partition we detect
+            /bin/mount $SWAP /mnt/
+            echo
+          fi
+        fi
+      done
+    done
+  done
+
+ if [ "$SFSWAP" == "" ]; then
+   echo "Error: could not parse the swap partition. Report the output of /etc/fstab to support@atomicorp.com"
+   echo
+   exit 1
+ fi
+
+  cd /mnt
+  echo
+
+  # Create the ISO's to grab array
+  for i in $ISOS; do
+    DETECTED=0
+    if [ -f $i ]; then
+      DETECTED=1
+    else
+      # populate the array with what to get
+      DOWNLOAD="$DOWNLOAD $i "
+    fi
+  done
+
+  # Download ISO's
+  if [ $DETECTED -eq 1 ]; then
+    echo "CentOS-$DISTVERSION-$ARCH all ISOS detected"
+  else
+    echo -n "Getting CentOS ISO: "
+    if [ "$LOCALSERVER" == "" ]; then
+      for l in $DOWNLOAD; do
+        wget $MIRRORSITE/$DISTVERSION/isos/$ARCH/$l
+      done
+    else
+      # this is probably never going to work again
+      wget http://localhost/CentOS-$DISTVERSION.ServerCD-$ARCH.iso
+    fi
+    echo "Done."
+  fi 
+
+  # Look for the first ISO
+  if [ ! -f $FIRSTISO ]; then
+    echo "Error: Cannot find the CentOS server image"
+    exit 1
+  fi
+
+  # Grab the ISO kernel
+  echo -n "Setting up installer kernel: "
+#    mkdir 1
+#    /bin/mount -o loop $FIRSTISO 1/
+#    cp 1/isolinux/vmlinuz /boot/vmlinuz.atomic
+#    cp 1/isolinux/initrd.img /boot/initrd.img.atomic
+    wget --no-cache -O - $MIRRORSITE/$DISTVERSION/os/$ARCH/isolinux/vmlinuz > /boot/vmlinuz.atomic
+    wget --no-cache -O - $MIRRORSITE/$DISTVERSION/os/$ARCH/isolinux/initrd.img > /boot/initrd.img.atomic
+  echo "Done"
+
+
+  # do the ks.cfg
+  # drop this off in / instead of /boot on a 1and1 system
+  cd /mnt
+  
+
+  if [ "$LOADER" == "LILO" ]; then
+    # 1and1 detection isnt so hot on older rh9/fc2 systems. Especially if they've been ASL'd
+    # Added to get this on a second run
+
+    BOOTLOADER=1AND1
+    if [ "$BOOTLOADER" == "1AND1" ]; then
+      # 1and1 x86_64 config
+      wget http://www.atomicorp.com/installers/AOOI/ks-1and1-$ARCH.cfg >/dev/null 2>&1
+      echo "ks path is hd:$KSDEV:ks-1and1$ARCH.cfg"
+
+
+
+      # write config to lilo
+      cat >> /etc/lilo.conf << EOF
+image=/boot/vmlinuz.atomic
+        label=atomic
+        initrd=/boot/initrd.img.atomic
+        append="ks=hd:$KSDEV:ks-1and1-$ARCH.cfg console=ttyS0,57600n8 ksdevice=eth0"
+EOF
+    else
+      #wget  
+      echo "This part of the installer, for lilo using non-1and1 systems isnt done yet"
+      echo "Use a net install"
+      exit 1
+    fi
+
+    # write to lilo
+    if [ -f /sbin/lilo ]; then
+      /sbin/lilo
+   else
+     echo "Error: lilo was detected as the bootloader, but /sbin/lilo was not detected."
+     exit 1
+   fi
+
+    # set the temp boot
+    echo "Setting the next reboot to use the ISO image"
+    /sbin/lilo -R atomic
+  else
+
+    # We're using grub, Add kernel to boot
+    addkernel
+  fi
+
+
+} 
+
+# this is easier on a net install, no vars needed
+function addkernel {
+  if [ "$LOADER" == "GRUB" ]; then
+    # were using grub
+    echo "Detected Grub, adding atomic entry"
+    
+    # if we're in network mode
+    if [ "$INSTALL" == "NETWORK" ]; then
+      if [ $NOGRUBBY -gt 0 ]; then
+	# an expiremental fix for debian since they dont have grubby
+        # we hose their grub config until a better way can be determined.
+cat << EOF > /boot/grub/menu.lst
+default=0
+timeout=5
+title	Atomic
+root	(hd0,0)
+kernel	/boot/vmlinuz.atomic ks=http://www.atomicorp.com/installers/AOOI/ks-$ARCH.cfg ip=$IPADDR netmask=$NETMASK gateway=$GATEWAY dns=$DNS ksdevice=eth0
+initrd	/boot/initrd.img.atomic
+EOF
+      else
+        /sbin/grubby --add-kernel=/boot/vmlinuz.atomic --initrd /boot/initrd.img.atomic --title "Atomic" \
+        --copy-default --args="ks=http://www.atomicorp.com/installers/AOOI/ks-$ARCH.cfg ip=$IPADDR netmask=$NETMASK gateway=$GATEWAY dns=$DNS"
+      fi
+
+    else
+
+      # if we're in local mode
+      cd /mnt
+      wget http://www.atomicorp.com/installers/AOOI/ks-1and1-$ARCH.cfg >/dev/null 2>&1
+      /sbin/grubby --add-kernel=/boot/vmlinuz.atomic --initrd /boot/initrd.img.atomic --title "Atomic" \
+      --copy-default --args="ks=hd:$KSDEV:ks-1and1-$ARCH.cfg ip=$IPADDR netmask=$NETMASK gateway=$GATEWAY dns=$DNS"
+    fi
+
+    # Boot only once
+    echo "Setting grub to boot the atomic entry *once*"
+/sbin/grub --batch <<EOF
+savedefault --default=0 --once
+EOF
+
+  else 
+    # We're using lilo
+    echo "Detected Lilo, adding atomic entry"
+    cat >> /etc/lilo.conf << EOF
+
+image=/boot/vmlinuz.atomic
+        label=atomic
+        initrd=/boot/initrd.img.atomic
+	append="ks=http://www.atomicorp.com/installers/AOOI/ks-$ARCH.cfg ip=$IPADDR netmask=$NETMASK gateway=$GATEWAY dns=$DNS console=tty0 console=tty1 console=ttyS0,57600n8"
+EOF
+
+    #Set lilo to boot it once
+    echo "Setting lilo to boot the atomic entry *once*"
+    /sbin/lilo
+    /sbin/lilo -R atomic
+  fi
+    
+
+}
+
+function check_input {
+  message=$1
+  validate=$2
+  default=$3
+
+  while [ $? -ne 1 ]; do
+    echo -n "$message "
+    read INPUTTEXT < /dev/tty
+    if [ "$INPUTTEXT" == "" -a "$default" != "" ]; then
+      INPUTTEXT=$default
+      return 1
+    fi
+    echo $INPUTTEXT | egrep -q "$validate" && return 1
+    echo "Invalid input, expecting ($validate)"
+    echo
+  done
+}
+
+# Logic for Network or Local install
+echo 
+echo "Do you want to perform an installation over the network, or from a locally"
+echo "cached ISO. Local installations may be required if for some reason the"
+echo "installation kernel cannot work correctly with your network card. For most"
+echo "installations, choose network."
+echo
+
+check_input "Network or Local installation (network/local) [Default: network] ?" "network|local" "network"
+
+if [ "$INPUTTEXT" == "network" ]; then
+  netinstall 
+else
+  localinstall
+fi
+
+
+echo
+echo
+echo "Done"
+echo
+echo
+
+echo "The installer has been configured, back up your data including your /etc/psa/psa.key, and reboot the system."
+echo "Root password has been temporarily set to: atomic555"
+echo
