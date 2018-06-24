@@ -12,7 +12,7 @@ Usage:
 
 
 Linux:
-wget -O - http://www.atomicorp.com/installers/aooi |sh
+wget -O - https://raw.githubusercontent.com/atomicturtle/aooi/master/aooi |sh
 
 Windows
 Download and run AOOI4WIN.vbs
